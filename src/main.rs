@@ -1,5 +1,9 @@
 use data_encoding::HEXLOWER;
 use futures_util::StreamExt;
+use librespot_connect::spirc::SpircLoadCommand;
+use librespot_core::SpotifyId;
+use librespot_protocol::spirc::TrackRef;
+use librespot_metadata::{Album, Metadata};
 use log::{debug, error, info, trace, warn};
 use sha1::{Digest, Sha1};
 use std::{
@@ -1819,6 +1823,73 @@ fn get_setup() -> Setup {
     }
 }
 
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+use tokio_util::codec::{FramedRead, LinesCodec};
+
+// https://open.spotify.com/album/4VELwCVLKeaG80pHsIOpr0?si=WI1BxfGhRdyJKHiBDq1_dw
+// load spotify:album:4VELwCVLKeaG80pHsIOpr0
+// TODO: handle context error
+
+async fn handle_client(mut tcp: tokio::net::TcpStream, session: Session, spirc: Arc<Spirc>) {
+    let (reader, mut writer) = tcp.split();
+    let mut stream = FramedRead::new(reader, LinesCodec::new());
+    while let Some(Ok(msg)) = stream.next().await {
+        info!("Received message: {:?}", msg);
+        if msg.starts_with("load ") {
+            if let Some(uri) = msg.split(" ").nth(1) {
+                let album = Album::get(&session, &SpotifyId::from_uri(&uri).unwrap())
+                    .await
+                    .unwrap();
+                let tracks = album
+                    .tracks()
+                    .map(|track_id| {
+                        let mut track = TrackRef::new();
+                        track.set_gid(Vec::from(track_id.to_raw()));
+                        track
+                    })
+                    .collect();
+                spirc.activate().unwrap();
+                spirc.load(SpircLoadCommand {
+                    context_uri: uri.to_string(),
+                    start_playing: true,
+                    shuffle: false,
+                    repeat: false,
+                    playing_track_index: 0,
+                    tracks,
+                }).unwrap();
+            } else {
+                warn!("Invalid load command");
+            }
+            return;
+        }
+        match msg.as_str() {
+            "play_pause" => {
+                spirc.play_pause().unwrap();
+            }
+            "play" => {
+                spirc.play().unwrap();
+            }
+            "pause" => {
+                spirc.pause().unwrap();
+            }
+            "next" => {
+                spirc.next().unwrap();
+            }
+            "previous" => {
+                spirc.prev().unwrap();
+            }
+            "status" => {
+                writer.write(b"ok\n").await.unwrap();
+            }
+            _ => {
+                warn!("Unknown command: {:?}", msg);
+            }
+        }
+    }
+
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     const RUST_BACKTRACE: &str = "RUST_BACKTRACE";
@@ -1833,7 +1904,7 @@ async fn main() {
     let setup = get_setup();
 
     let mut last_credentials = None;
-    let mut spirc: Option<Spirc> = None;
+    let mut spirc: Option<Arc<Spirc>> = None;
     let mut spirc_task: Option<Pin<_>> = None;
     let mut auto_connect_times: Vec<Instant> = vec![];
     let mut discovery = None;
@@ -1923,6 +1994,10 @@ async fn main() {
     let player = Player::new(player_config, session.clone(), soft_volume, move || {
         (backend)(device, format)
     });
+    // brew install telnet
+    // TODO: optionally listen on unix or tcp socket
+    // credit: https://github.com/pretzelhammer/rust-blog/blob/master/posts/chat-server.md
+    let server = tokio::net::TcpListener::bind("127.0.0.1:42069").await.unwrap();
 
     if let Some(player_event_program) = setup.player_event_program.clone() {
         _event_handler = Some(EventHandler::new(
@@ -1939,6 +2014,17 @@ async fn main() {
 
     loop {
         tokio::select! {
+            tcp = server.accept() => {
+                let (mut tcp, _addr) = tcp.unwrap();
+                info!("Received connection on control server: {:?}", tcp);
+                // TODO: client handler should dynamically handle if spirc is not ready
+                if let Some(ref spirc) = spirc {
+                    tokio::spawn(handle_client(tcp, session.clone(), spirc.clone()));
+                } else {
+                    warn!("Received connection on control server but spirc is not ready");
+                    tcp.write(b"not_ready\n").await.unwrap();
+                }
+            },
             credentials = async {
                 match discovery.as_mut() {
                     Some(d) => d.next().await,
@@ -1990,7 +2076,7 @@ async fn main() {
                         exit(1);
                     }
                 };
-                spirc = Some(spirc_);
+                spirc = Some(Arc::new(spirc_));
                 spirc_task = Some(Box::pin(spirc_task_));
 
                 connecting = false;

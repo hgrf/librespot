@@ -64,6 +64,7 @@ sha1 = "0.10"
 sysinfo = { version = "0.31.3", default-features = false, features = ["system"] }
 thiserror = "1.0"
 tokio = { version = "1.40", features = ["rt", "macros", "signal", "sync", "parking_lot", "process"] }
+tokio-util = "0.7"
 url = "2.2"
 
 [features]
